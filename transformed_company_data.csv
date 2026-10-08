@@ -1,0 +1,44 @@
+import pandas as pd
+import numpy as np
+
+# Load your dataset
+df = pd.read_csv('Company Data.csv')
+
+# Create synthetic company names
+df['Company'] = [f'Company_{i+1}' for i in range(len(df))]
+
+# Create synthetic sectors based on risk or random assignment
+np.random.seed(42)
+sectors = ['Technology', 'Healthcare', 'Finance', 'Manufacturing', 'Retail', 'Energy']
+df['Sector'] = np.random.choice(sectors, size=len(df))
+
+# Create synthetic Market Cap (in billions)
+df['Market_Cap'] = np.random.uniform(10, 500, size=len(df)).round(2)
+
+# Create synthetic financial figures based on ratios
+# Base revenue (in millions)
+base_revenue = np.random.uniform(1000, 50000, size=len(df))
+
+# Calculate derived financials using ratios
+df['Revenue'] = base_revenue.round(2)
+
+# Use PATTI (Profit After Tax to Total Income) to estimate Net Income
+if 'PATTI' in df.columns:
+    # Handle missing values
+    df['PATTI'] = df['PATTI'].fillna(0.05)  # Default 5% profit margin
+    df['Net_Income'] = (df['Revenue'] * df['PATTI']).round(2)
+else:
+    df['Net_Income'] = (df['Revenue'] * 0.1).round(2)  # Assume 10% profit margin
+
+# Calculate Expenses = Revenue - Net_Income
+df['Expenses'] = (df['Revenue'] - df['Net_Income']).round(2)
+
+# Add a date column (use current date or quarterly)
+df['Date'] = pd.Timestamp.now().strftime('%Y-%m-%d')
+
+# Select only the columns needed for the original app
+transformed_df = df[['Company', 'Date', 'Revenue', 'Expenses', 'Net_Income', 'Sector', 'Market_Cap']]
+
+# Save the transformed dataset
+transformed_df.to_csv('transformed_company_data.csv', index=False)
+print("Transformed dataset saved as 'transformed_company_data.csv'")

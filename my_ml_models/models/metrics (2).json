@@ -1,0 +1,14 @@
+{
+  "Logistic Regression": {
+    "accuracy": 0.7500724217844728,
+    "model": "Logistic Regression"
+  },
+  "Random Forest": {
+    "accuracy": 0.9014339513325609,
+    "model": "Random Forest"
+  },
+  "Neural Network": {
+    "accuracy": 0.9514049826187717,
+    "model": "Neural Network"
+  }
+}
