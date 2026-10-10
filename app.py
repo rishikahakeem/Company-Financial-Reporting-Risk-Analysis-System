@@ -1,793 +1,1156 @@
-import streamlit as st
+import os
+import json
+import sqlite3
+import hashlib
+import hmac
+import secrets
+from datetime import datetime
+
+import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
-import os
-from datetime import datetime
-import numpy as np
-import json
+import streamlit as st
 
-# Page configuration
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.metrics import accuracy_score
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+
+
+# ============================================================
+# APP CONFIGURATION
+# ============================================================
+
 st.set_page_config(
-    page_title="Automated Financial Report Generator",
+    page_title="Financial Report Generator",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Custom CSS for better styling
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 0.5rem 0;
-    }
-    .success-box {
-        background-color: #d4edda;
-        border-left: 4px solid #28a745;
-        padding: 1rem;
-        margin: 1rem 0;
-    }
-    .warning-box {
-        background-color: #fff3cd;
-        border-left: 4px solid #ffc107;
-        padding: 1rem;
-        margin: 1rem 0;
-    }
-    .stProgress .st-bo {
-        background-color: #1f77b4;
-    }
-    div[data-testid="stMetricValue"] {
-        font-size: 2rem;
-    }
-</style>
-""", unsafe_allow_html=True)
+DB_FILE = "users.db"
+OLLAMA_URL = os.getenv(
+    "OLLAMA_URL",
+    "http://127.0.0.1:11434/api/generate",
+)
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 
-class FinancialReportGenerator:
-    """Custom report generator adapted for financial ratios dataset"""
-    
-    def __init__(self):
-        self.data = None
-        self.processed_data = None
-        
-    def load_data(self, file_path):
-        """Load and transform the ratio data to match expected format"""
-        # Read the original data
-        self.data = pd.read_csv(file_path)
-        
-        # Create transformed dataframe with required columns
-        transformed = pd.DataFrame()
-        
-        # 1. Create company names
-        transformed['Company'] = [f'Company_{i+1:03d}' for i in range(len(self.data))]
-        
-        # 2. Create sectors based on risk or random assignment
-        np.random.seed(42)
-        sectors = ['Technology', 'Healthcare', 'Finance', 'Manufacturing', 'Retail', 'Energy', 
-                  'Consumer Goods', 'Industrial', 'Utilities', 'Real Estate']
-        
-        # Use risk column to influence sector distribution (0=low risk, 1=high risk)
-        if 'risk' in self.data.columns:
-            # Riskier companies more likely to be in volatile sectors
-            risk_sectors = ['Technology', 'Energy', 'Retail']
-            safe_sectors = ['Utilities', 'Healthcare', 'Consumer Goods']
-            
-            transformed['Sector'] = self.data['risk'].apply(
-                lambda x: np.random.choice(risk_sectors if x == 1 else safe_sectors)
+st.markdown(
+    """
+    <style>
+    .main {
+        background-color: #f7f9fc;
+    }
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 2rem;
+    }
+    [data-testid="stMetric"] {
+        background-color: white;
+        padding: 15px;
+        border-radius: 10px;
+        border: 1px solid #e5e7eb;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# AUTHENTICATION DATABASE
+# ============================================================
+
+def init_auth_database():
+    """Create the users table if it does not exist."""
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                salt TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
-        else:
-            transformed['Sector'] = np.random.choice(sectors, size=len(self.data))
-        
-        # 3. Create synthetic Market Cap based on company size indicators
-        # Use RTA (Return on Total Assets) or other metrics as proxy for size
-        if 'RTA' in self.data.columns:
-            size_proxy = self.data['RTA'].fillna(self.data['RTA'].median())
-            # Normalize to get market cap between 100M and 500B
-            normalized = (size_proxy - size_proxy.min()) / (size_proxy.max() - size_proxy.min() + 1e-10)
-            transformed['Market_Cap'] = (100 + normalized * 4900) * 1e6  # in dollars
-        else:
-            transformed['Market_Cap'] = np.random.uniform(100, 5000, size=len(self.data)) * 1e6
-        
-        # 4. Create synthetic Revenue using available ratios as proxies
-        # Use multiple ratios to estimate company size/revenue
-        revenue_proxies = []
-        
-        if 'RTA' in self.data.columns:
-            revenue_proxies.append(self.data['RTA'].fillna(self.data['RTA'].median()))
-        if 'ROCE' in self.data.columns:
-            revenue_proxies.append(self.data['ROCE'].fillna(self.data['ROCE'].median()) * 10)
-        if 'PATTI' in self.data.columns:
-            revenue_proxies.append(self.data['PATTI'].fillna(self.data['PATTI'].median()) * 100)
-        
-        if revenue_proxies:
-            # Combine proxies
-            combined_proxy = pd.concat(revenue_proxies, axis=1).mean(axis=1)
-            # Normalize to get revenue between 10M and 100B
-            norm_proxy = (combined_proxy - combined_proxy.min()) / (combined_proxy.max() - combined_proxy.min() + 1e-10)
-            transformed['Revenue'] = (10 + norm_proxy * 9990) * 1e6  # in dollars
-        else:
-            transformed['Revenue'] = np.random.uniform(10, 10000, size=len(self.data)) * 1e6
-        
-        # 5. Calculate Net Income using profit ratios
-        if 'PATTI' in self.data.columns:
-            # PATTI is Profit After Tax to Total Income - directly gives profit margin
-            profit_margin = self.data['PATTI'].fillna(0.05).abs()  # Use absolute value
-            transformed['Net_Income'] = transformed['Revenue'] * profit_margin
-        elif 'ROCE' in self.data.columns:
-            # Use ROCE as rough profit indicator
-            profit_factor = self.data['ROCE'].fillna(0.1).abs() / 100
-            transformed['Net_Income'] = transformed['Revenue'] * profit_factor
-        else:
-            # Default 10% profit margin
-            transformed['Net_Income'] = transformed['Revenue'] * 0.1
-        
-        # 6. Calculate Expenses = Revenue - Net_Income
-        transformed['Expenses'] = transformed['Revenue'] - transformed['Net_Income']
-        
-        # 7. Add date column
-        transformed['Date'] = pd.Timestamp.now().strftime('%Y-%m-%d')
-        
-        # Round all financial values to 2 decimals (in millions for display)
-        for col in ['Revenue', 'Expenses', 'Net_Income', 'Market_Cap']:
-            transformed[col] = transformed[col].round(2)
-        
-        self.processed_data = transformed
-        return transformed
-    
-    def generate_basic_report(self):
-        """Generate basic financial metrics"""
-        df = self.processed_data
-        
-        report = {
-            'total_companies': len(df),
-            'total_revenue': df['Revenue'].sum(),
-            'total_expenses': df['Expenses'].sum(),
-            'total_net_income': df['Net_Income'].sum(),
-            'average_revenue': df['Revenue'].mean(),
-            'average_expenses': df['Expenses'].mean(),
-            'average_net_income': df['Net_Income'].mean(),
-            'profit_margin_avg': (df['Net_Income'].sum() / df['Revenue'].sum() * 100),
-            'expense_ratio_avg': (df['Expenses'].sum() / df['Revenue'].sum() * 100)
-        }
-        
-        return report
-    
-    def get_company_insights(self):
-        """Get company-level insights"""
-        df = self.processed_data.copy()
-        
-        # Calculate profit margin for each company
-        df['Profit_Margin'] = (df['Net_Income'] / df['Revenue'] * 100).round(2)
-        
-        # Group by company (though each appears once in this dataset)
-        insights = df.groupby('Company').agg({
-            'Revenue': 'sum',
-            'Expenses': 'sum',
-            'Net_Income': 'sum',
-            'Profit_Margin': 'mean',
-            'Sector': 'first',
-            'Market_Cap': 'first'
-        }).rename(columns={
-            'Revenue': 'Revenue_sum',
-            'Expenses': 'Expenses_sum',
-            'Net_Income': 'Net_Income_sum'
-        }).reset_index()
-        
-        return insights
-    
-    def get_sector_analysis(self):
-        """Generate sector-level analysis"""
-        if 'Sector' not in self.processed_data.columns:
-            return pd.DataFrame()
-        
-        df = self.processed_data.copy()
-        df['Profit_Margin'] = (df['Net_Income'] / df['Revenue'] * 100).round(2)
-        
-        sector_analysis = df.groupby('Sector').agg({
-            'Revenue': 'sum',
-            'Net_Income': 'sum',
-            'Profit_Margin': 'mean',
-            'Company': 'count',
-            'Market_Cap': 'mean'
-        }).rename(columns={
-            'Revenue': 'Revenue_sum',
-            'Net_Income': 'Net_Income_sum',
-            'Profit_Margin': 'Avg_Profit_Margin',
-            'Company': 'Company_Count',
-            'Market_Cap': 'Avg_Market_Cap'
-        }).reset_index()
-        
-        return sector_analysis
-    
-    def generate_risk_assessment(self):
-        """Generate risk assessment"""
-        risk_data = {
-            'high_debt_companies': 0,
-            'low_profit_margin_companies': 0,
-            'average_volatility': 0,
-            'companies_at_risk': []
-        }
-        
-        df = self.processed_data.copy()
-        df['Profit_Margin'] = (df['Net_Income'] / df['Revenue'] * 100).round(2)
-        
-        # Identify companies with low profit margins
-        low_margin = df[df['Profit_Margin'] < 5]
-        risk_data['low_profit_margin_companies'] = len(low_margin)
-        
-        # Use original risk column if available
-        if hasattr(self, 'data') and 'risk' in self.data.columns:
-            risk_indices = self.data[self.data['risk'] == 1].index
-            if len(risk_indices) > 0:
-                risk_companies = df.iloc[risk_indices]['Company'].tolist()
-                risk_data['companies_at_risk'].extend(risk_companies)
-                risk_data['high_debt_companies'] = len(risk_companies)
-        
-        # Add some companies from low margin if no risk column
-        if not risk_data['companies_at_risk'] and len(low_margin) > 0:
-            risk_data['companies_at_risk'] = low_margin.head(5)['Company'].tolist()
-            risk_data['high_debt_companies'] = len(risk_data['companies_at_risk'])
-        
-        # Calculate volatility (standard deviation of profit margins)
-        risk_data['average_volatility'] = df['Profit_Margin'].std()
-        
-        return risk_data
-    
-    def identify_top_performers(self):
-        """Identify top performing companies"""
-        df = self.processed_data.copy()
-        df['Profit_Margin'] = (df['Net_Income'] / df['Revenue'] * 100).round(2)
-        
-        # Top 10 by revenue
-        top_revenue = df.nlargest(10, 'Revenue')[['Company', 'Revenue', 'Profit_Margin']]
-        
-        # Top 10 by profit margin
-        top_margin = df.nlargest(10, 'Profit_Margin')[['Company', 'Profit_Margin', 'Revenue']]
-        
-        return pd.concat([top_revenue, top_margin]).drop_duplicates('Company')
+            """
+        )
 
-# Simple GPT summary generator (optional)
-def generate_basic_summary(basic_report):
-    """Generate a basic text summary"""
-    summary = f"""
-Financial Summary:
-- Total Companies: {basic_report['total_companies']}
-- Total Revenue: ${basic_report['total_revenue']/1e6:,.0f}M
-- Total Net Income: ${basic_report['total_net_income']/1e6:,.0f}M
-- Average Profit Margin: {basic_report['profit_margin_avg']:.1f}%
-- Average Expense Ratio: {basic_report['expense_ratio_avg']:.1f}%
 
-Market Overview:
-- Largest Company Revenue: ${basic_report['average_revenue']*2/1e6:,.0f}M (estimated max)
-- Industry Average Revenue: ${basic_report['average_revenue']/1e6:,.0f}M per company
+def hash_password(password, salt=None):
+    """Hash a password rather than storing it as plain text."""
+    if salt is None:
+        salt = secrets.token_hex(16)
+
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        bytes.fromhex(salt),
+        200_000,
+    ).hex()
+
+    return salt, password_hash
+
+
+def register_user(name, email, password):
+    """Create a new account."""
+    name = name.strip()
+    email = email.strip().lower()
+
+    if not name or not email or not password:
+        return False, "Please complete all fields."
+
+    if "@" not in email or "." not in email.split("@")[-1]:
+        return False, "Please enter a valid email address."
+
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters."
+
+    salt, password_hash = hash_password(password)
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute(
+                """
+                INSERT INTO users
+                    (name, email, salt, password_hash, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    name,
+                    email,
+                    salt,
+                    password_hash,
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+        return True, "Account created! You can now log in."
+    except sqlite3.IntegrityError:
+        return False, "An account with this email already exists."
+
+
+def authenticate_user(email, password):
+    """Check the email and password."""
+    email = email.strip().lower()
+
+    with sqlite3.connect(DB_FILE) as conn:
+        user = conn.execute(
+            """
+            SELECT id, name, email, salt, password_hash
+            FROM users
+            WHERE email = ?
+            """,
+            (email,),
+        ).fetchone()
+
+    if not user:
+        return None
+
+    user_id, name, saved_email, salt, saved_hash = user
+    _, entered_hash = hash_password(password, salt)
+
+    if hmac.compare_digest(entered_hash, saved_hash):
+        return {
+            "id": user_id,
+            "name": name,
+            "email": saved_email,
+        }
+
+    return None
+
+
+def logout():
+    """End the current login session."""
+    st.session_state.logged_in = False
+    st.session_state.pop("user", None)
+    # The radio key must be changed before its widget is created.
+    st.session_state.auth_mode = "Login"
+    st.rerun()
+
+
+def show_auth_page():
+    """Display Sign Up and Login screens."""
+    st.markdown(
+        "<h1 style='text-align:center;'>📊 Financial Report Generator</h1>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<p style='text-align:center;'>"
+        "Analyze company performance, financial risks, and trends."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    st.write("")
+    _, center, _ = st.columns([1, 1.4, 1])
+
+    with center:
+        # Set the radio's state BEFORE creating the widget.
+        if "auth_mode" not in st.session_state:
+            st.session_state.auth_mode = "Login"
+
+        if st.session_state.pop("switch_to_login", False):
+            st.session_state.auth_mode = "Login"
+
+        mode = st.radio(
+            "Welcome",
+            ["Login", "Sign Up"],
+            horizontal=True,
+            key="auth_mode",
+        )
+
+        if mode == "Sign Up":
+            with st.form("signup_form"):
+                name = st.text_input("Full name")
+                email = st.text_input("Email address")
+                password = st.text_input(
+                    "Password",
+                    type="password",
+                    help="Use at least 8 characters.",
+                )
+                confirm_password = st.text_input(
+                    "Confirm password",
+                    type="password",
+                )
+                submitted = st.form_submit_button(
+                    "Create Account",
+                    use_container_width=True,
+                )
+
+            if submitted:
+                if password != confirm_password:
+                    st.error("Passwords do not match.")
+                else:
+                    success, message = register_user(name, email, password)
+                    if success:
+                        st.success(message)
+                        # Change radio state on the next run, before st.radio.
+                        st.session_state.switch_to_login = True
+                        st.rerun()
+                    else:
+                        st.error(message)
+
+        else:
+            with st.form("login_form"):
+                email = st.text_input("Email address")
+                password = st.text_input("Password", type="password")
+                submitted = st.form_submit_button(
+                    "Login",
+                    use_container_width=True,
+                )
+
+            if submitted:
+                user = authenticate_user(email, password)
+                if user:
+                    st.session_state.logged_in = True
+                    st.session_state.user = user
+                    st.rerun()
+                else:
+                    st.error("Invalid email or password.")
+
+        st.caption(
+            "Demo authentication. Use a unique password and do not "
+            "reuse your personal account password."
+        )
+
+
+# ============================================================
+# FINANCIAL DATA
+# ============================================================
+
+FINANCIAL_COLUMNS = [
+    "Company",
+    "Sector",
+    "Revenue",
+    "Expenses",
+    "Total Assets",
+    "Total Debt",
+    "Current Assets",
+    "Current Liabilities",
+]
+
+
+def get_sample_data():
+    """Provide sample data for trying the app."""
+    return pd.DataFrame(
+        [
+            {
+                "Company": "Alpha Technologies",
+                "Sector": "Technology",
+                "Revenue": 12_500_000,
+                "Expenses": 8_750_000,
+                "Total Assets": 18_000_000,
+                "Total Debt": 4_500_000,
+                "Current Assets": 6_200_000,
+                "Current Liabilities": 3_100_000,
+            },
+            {
+                "Company": "Bright Retail",
+                "Sector": "Retail",
+                "Revenue": 9_800_000,
+                "Expenses": 8_500_000,
+                "Total Assets": 12_000_000,
+                "Total Debt": 6_500_000,
+                "Current Assets": 2_800_000,
+                "Current Liabilities": 3_500_000,
+            },
+            {
+                "Company": "Green Energy",
+                "Sector": "Energy",
+                "Revenue": 15_800_000,
+                "Expenses": 11_000_000,
+                "Total Assets": 25_000_000,
+                "Total Debt": 7_000_000,
+                "Current Assets": 8_000_000,
+                "Current Liabilities": 4_000_000,
+            },
+            {
+                "Company": "Care Medical",
+                "Sector": "Healthcare",
+                "Revenue": 11_200_000,
+                "Expenses": 9_300_000,
+                "Total Assets": 14_500_000,
+                "Total Debt": 6_000_000,
+                "Current Assets": 3_600_000,
+                "Current Liabilities": 3_000_000,
+            },
+            {
+                "Company": "Future Manufacturing",
+                "Sector": "Manufacturing",
+                "Revenue": 21_000_000,
+                "Expenses": 17_500_000,
+                "Total Assets": 32_000_000,
+                "Total Debt": 9_000_000,
+                "Current Assets": 9_500_000,
+                "Current Liabilities": 5_000_000,
+            },
+        ]
+    )
+
+
+def prepare_data(data):
+    """Validate and calculate financial metrics."""
+    data = data.copy()
+
+    missing = [column for column in FINANCIAL_COLUMNS if column not in data.columns]
+    if missing:
+        raise ValueError("Missing required columns: " + ", ".join(missing))
+
+    for column in FINANCIAL_COLUMNS[2:]:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+
+    if data[FINANCIAL_COLUMNS[2:]].isna().any().any():
+        raise ValueError("Financial columns contain blank or non-numeric values.")
+
+    if (data[FINANCIAL_COLUMNS[2:]] < 0).any().any():
+        raise ValueError("Financial amounts cannot be negative.")
+
+    if (data["Current Liabilities"] == 0).any():
+        raise ValueError("Current Liabilities must be greater than zero.")
+
+    if (data["Total Assets"] == 0).any():
+        raise ValueError("Total Assets must be greater than zero.")
+
+    data["Company"] = data["Company"].astype(str).str.strip()
+    data["Sector"] = data["Sector"].astype(str).str.strip()
+
+    if (data["Company"] == "").any() or (data["Sector"] == "").any():
+        raise ValueError("Company and Sector values cannot be blank.")
+
+    data["Profit"] = data["Revenue"] - data["Expenses"]
+    data["Profit Margin (%)"] = np.where(
+        data["Revenue"] > 0,
+        data["Profit"] / data["Revenue"] * 100,
+        0,
+    )
+    data["Current Ratio"] = data["Current Assets"] / data["Current Liabilities"]
+    data["Debt Ratio (%)"] = data["Total Debt"] / data["Total Assets"] * 100
+    data["Asset Turnover"] = np.where(
+        data["Total Assets"] > 0,
+        data["Revenue"] / data["Total Assets"],
+        0,
+    )
+    return data
+
+
+def risk_label(row):
+    """Create a simple rule-based risk label."""
+    score = 0
+    if row["Profit Margin (%)"] < 5:
+        score += 1
+    if row["Current Ratio"] < 1:
+        score += 1
+    if row["Debt Ratio (%)"] > 60:
+        score += 1
+    if row["Profit"] < 0:
+        score += 1
+
+    if score >= 3:
+        return "High Risk"
+    if score >= 1:
+        return "Medium Risk"
+    return "Low Risk"
+
+
+def add_risk_assessment(data):
+    data = data.copy()
+    data["Risk Level"] = data.apply(risk_label, axis=1)
+    return data
+
+
+def money(value):
+    return f"₹{value:,.0f}"
+
+
+# ============================================================
+# REPORT AND AI FUNCTIONS
+# ============================================================
+
+def build_financial_summary(data):
+    total_revenue = data["Revenue"].sum()
+    total_expenses = data["Expenses"].sum()
+    total_profit = data["Profit"].sum()
+    overall_margin = total_profit / total_revenue * 100 if total_revenue else 0
+
+    return {
+        "report_generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "number_of_companies": int(len(data)),
+        "total_revenue": float(total_revenue),
+        "total_expenses": float(total_expenses),
+        "total_profit": float(total_profit),
+        "overall_profit_margin_percent": round(overall_margin, 2),
+        "high_risk_companies": int((data["Risk Level"] == "High Risk").sum()),
+        "medium_risk_companies": int((data["Risk Level"] == "Medium Risk").sum()),
+        "low_risk_companies": int((data["Risk Level"] == "Low Risk").sum()),
+    }
+
+
+def generate_ai_insights(data):
+    """Generate insights with local Ollama, if available."""
+    if not REQUESTS_AVAILABLE:
+        return "Install the requests package to enable local AI insights."
+
+    summary = build_financial_summary(data)
+    company_data = data[
+        [
+            "Company",
+            "Sector",
+            "Revenue",
+            "Expenses",
+            "Profit",
+            "Profit Margin (%)",
+            "Current Ratio",
+            "Debt Ratio (%)",
+            "Risk Level",
+        ]
+    ].to_dict(orient="records")
+
+    prompt = f"""
+You are a financial analysis assistant.
+
+Analyze the following financial data:
+{json.dumps(company_data, indent=2)}
+
+Overall summary:
+{json.dumps(summary, indent=2)}
+
+Write a beginner-friendly report containing:
+1. Overall financial performance
+2. Profitability observations
+3. Liquidity concerns
+4. Debt and financial risk observations
+5. Practical recommendations
+
+Use only the supplied data. Do not invent missing information.
+Explain that the results are estimates and not financial advice.
 """
-    return summary
 
-def main():
-    # Main title
-    st.markdown('<h1 class="main-header">📊 Automated Financial Report Generator</h1>', 
-                unsafe_allow_html=True)
-    
-    # Sidebar configuration
-    with st.sidebar:
-        st.header("⚙️ Configuration")
-        
-        # API Key input (kept for compatibility)
-        api_key = st.text_input(
-            "OpenAI API Key (Optional)", 
-            type="password",
-            help="Enter your OpenAI API key for AI-powered insights (optional)"
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+            },
+            timeout=60,
         )
-        
-        # Analysis options
-        st.subheader("📈 Analysis Options")
-        show_visualizations = st.checkbox("Show Visualizations", value=True)
-        show_sector_analysis = st.checkbox("Sector Analysis", value=True)
-        show_risk_assessment = st.checkbox("Risk Assessment", value=True)
-        show_gpt_insights = st.checkbox("GPT-4 Insights", value=False, disabled=not api_key)
-        
-        st.divider()
-        
-        # Sample data section
-        st.subheader("📂 Sample Data")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Load Sample Data", use_container_width=True):
-                st.session_state.load_sample = "sample"
-        with col2:
-            if st.button("Load Tech Companies", use_container_width=True):
-                st.session_state.load_sample = "tech"
-        
-        if st.button("Load Mixed Sectors", use_container_width=True):
-            st.session_state.load_sample = "mixed"
-        
-        # Note about dataset
-        st.info("""
-        **📌 Dataset Note:**
-        Your dataset contains financial ratios. The app creates synthetic 
-        Revenue/Expenses based on these ratios to match the required format.
-        
-        **Required columns:** risk, RTA, ROCE, PATTI (or similar ratios)
-        """)
+        response.raise_for_status()
+        result = response.json().get("response", "").strip()
+        if not result:
+            return "The AI service returned an empty response."
+        return result
+    except requests.exceptions.ConnectionError:
+        return (
+            "Could not connect to Ollama. Start Ollama locally and "
+            f"download the model with `ollama pull {OLLAMA_MODEL}`. "
+            "Then restart this analysis."
+        )
+    except requests.exceptions.Timeout:
+        return "The AI request timed out. Try again or use a smaller dataset."
+    except Exception as exc:
+        return f"AI analysis could not be completed: {exc}"
 
-    # Initialize the financial report generator
-    if 'report_generator' not in st.session_state:
-        st.session_state.report_generator = FinancialReportGenerator()
-    
-    # File upload section
-    st.header("📤 Data Upload")
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        uploaded_file = st.file_uploader(
-            "Upload Financial Data (CSV)", 
-            type=["csv"],
-            help="Upload your financial ratios CSV file"
+
+def create_report_text(data):
+    summary = build_financial_summary(data)
+    lines = [
+        "AUTOMATED FINANCIAL REPORT",
+        "=" * 40,
+        f"Generated: {summary['report_generated']}",
+        f"Companies analyzed: {summary['number_of_companies']}",
+        "",
+        "FINANCIAL SUMMARY",
+        "-" * 40,
+        f"Total Revenue: {money(summary['total_revenue'])}",
+        f"Total Expenses: {money(summary['total_expenses'])}",
+        f"Total Profit: {money(summary['total_profit'])}",
+        f"Overall Profit Margin: {summary['overall_profit_margin_percent']}%",
+        "",
+        "RISK SUMMARY",
+        "-" * 40,
+        f"High Risk: {summary['high_risk_companies']}",
+        f"Medium Risk: {summary['medium_risk_companies']}",
+        f"Low Risk: {summary['low_risk_companies']}",
+        "",
+        "COMPANY DETAILS",
+        "-" * 40,
+    ]
+
+    for _, row in data.iterrows():
+        lines.extend(
+            [
+                f"Company: {row['Company']}",
+                f"Sector: {row['Sector']}",
+                f"Revenue: {money(row['Revenue'])}",
+                f"Expenses: {money(row['Expenses'])}",
+                f"Profit: {money(row['Profit'])}",
+                f"Profit Margin: {row['Profit Margin (%)']:.2f}%",
+                f"Current Ratio: {row['Current Ratio']:.2f}",
+                f"Debt Ratio: {row['Debt Ratio (%)']:.2f}%",
+                f"Risk Level: {row['Risk Level']}",
+                "",
+            ]
         )
-        
-        # File size limit info
-        st.caption("Limit 200MB per file · CSV only")
-        
-        # Show sample file info if available
-        if uploaded_file is None and 'last_upload' in st.session_state:
-            st.info(f"📎 Last file: {st.session_state.last_upload}  0.9KB")
-    
-    with col2:
-        st.markdown("""
-        **Required CSV Columns:**
-        - Company
-        - Revenue
-        - Expenses
-        - Net_Income
-        
-        **Optional:**
-        - Date
-        - Sector
-        - Market_Cap
-        """)
-        
-        # Sample data loaded message
-        if 'sample_loaded' in st.session_state and st.session_state.sample_loaded:
-            st.success("✅ Sample data loaded successfully!")
-    
-    # Handle sample data loading
-    if 'load_sample' in st.session_state:
-        sample_type = st.session_state.load_sample
-        # Create sample data based on selection
-        np.random.seed(42)
-        n_companies = 20 if sample_type == "tech" else 30 if sample_type == "mixed" else 15
-        
-        # Create sample ratios data
-        sample_data = pd.DataFrame({
-            'risk': np.random.choice([0, 1], size=n_companies, p=[0.7, 0.3]),
-            'RTA': np.random.uniform(5, 25, n_companies),
-            'ROCE': np.random.uniform(8, 35, n_companies),
-            'PATTI': np.random.uniform(2, 18, n_companies),
-            'CURRENT': np.random.uniform(0.5, 3.5, n_companies),
-            'QUICK': np.random.uniform(0.3, 2.5, n_companies),
-            'DER': np.random.uniform(0.2, 3.0, n_companies),
-            'DSCR': np.random.uniform(0.8, 4.5, n_companies)
-        })
-        
-        # Save temporarily and load
-        temp_path = "temp_sample.csv"
-        sample_data.to_csv(temp_path, index=False)
-        
-        try:
-            df = st.session_state.report_generator.load_data(temp_path)
-            st.session_state.sample_loaded = True
-            st.session_state.last_upload = "sample_edgar.csv"
-            os.remove(temp_path)
+
+    lines.append(
+        "Note: This report is based on supplied data and is not "
+        "professional financial advice."
+    )
+    return "\n".join(lines)
+
+
+# ============================================================
+# PAGE: HOME
+# ============================================================
+
+def page_home(data):
+    st.title("📊 Financial Report Generator")
+    st.write(
+        "Welcome to your company financial reporting and risk analysis dashboard."
+    )
+    summary = build_financial_summary(data)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Companies", summary["number_of_companies"])
+    c2.metric("Total Revenue", money(summary["total_revenue"]))
+    c3.metric("Total Profit", money(summary["total_profit"]))
+    c4.metric("Profit Margin", f"{summary['overall_profit_margin_percent']:.2f}%")
+
+    st.subheader("What you can do")
+    st.markdown(
+        """
+        - Upload company financial data from a CSV file.
+        - View profitability, liquidity, and debt metrics.
+        - Compare companies and business sectors.
+        - Identify companies with potential financial risks.
+        - Try an experimental machine-learning risk classifier.
+        - Generate AI-assisted insights using local Ollama.
+        - Download financial reports as CSV, JSON, or TXT.
+        """
+    )
+    st.info(
+        "Start with the sample dataset, or upload your own data "
+        "from the Data Upload page."
+    )
+
+
+# ============================================================
+# PAGE: DATA UPLOAD
+# ============================================================
+
+def page_data_upload():
+    st.title("📁 Data Upload")
+    st.write("Upload a CSV containing company financial information.")
+    st.markdown("Required columns:")
+    st.code(", ".join(FINANCIAL_COLUMNS))
+
+    uploaded_file = st.file_uploader("Choose a CSV file", type=["csv"])
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if st.button("Load Sample Data", use_container_width=True):
+            st.session_state.financial_data = get_sample_data()
+            st.success("Sample data loaded.")
             st.rerun()
-        except Exception as e:
-            st.error(f"Error loading sample: {str(e)}")
-        
-        del st.session_state.load_sample
-    
-    # Handle data loading from upload
-    data_loaded = False
-    df = None
-    
+
+    with c2:
+        sample_csv = get_sample_data().to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download Sample CSV",
+            data=sample_csv,
+            file_name="sample_financial_data.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
     if uploaded_file is not None:
         try:
-            # Save temporarily
-            temp_path = "temp_upload.csv"
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            
-            # Load through our custom generator
-            df = st.session_state.report_generator.load_data(temp_path)
-            data_loaded = True
-            st.session_state.sample_loaded = True
-            st.session_state.last_upload = uploaded_file.name
-            os.remove(temp_path)
-            st.success("✅ Data loaded and transformed successfully!")
-            
-        except Exception as e:
-            st.error(f"❌ Error loading file: {str(e)}")
-    
-    # Use sample data if loaded
-    if 'sample_loaded' in st.session_state and st.session_state.sample_loaded and df is None:
-        if hasattr(st.session_state.report_generator, 'processed_data'):
-            df = st.session_state.report_generator.processed_data
-            data_loaded = True
-    
-    # Main analysis section
-    if data_loaded and df is not None:
-        
-        # Display raw data preview
-        st.header("📋 Data Preview")
-        
-        tab1, tab2 = st.tabs(["Original Ratios", "Transformed Financials"])
-        
-        with tab1:
-            if hasattr(st.session_state.report_generator, 'data'):
-                st.dataframe(st.session_state.report_generator.data.head(10), use_container_width=True)
-                st.info(f"Original dataset contains {len(st.session_state.report_generator.data)} companies")
-            else:
-                st.info("Original ratios not available")
-        
-        with tab2:
-            # Convert to millions for display
-            display_df = df[['Company', 'Sector', 'Revenue', 'Expenses', 'Net_Income', 'Market_Cap', 'Date']].head(10).copy()
-            for col in ['Revenue', 'Expenses', 'Net_Income', 'Market_Cap']:
-                display_df[col] = (display_df[col] / 1e6).round(2)
-            st.dataframe(display_df, use_container_width=True)
-            st.info(f"Transformed dataset has {len(df)} records with synthetic Revenue/Expenses (values in $M)")
-        
-        # Generate basic report
-        st.header("📊 Financial Analysis Dashboard")
-        
-        try:
-            # Basic financial metrics
-            basic_report = st.session_state.report_generator.generate_basic_report()
-            
-            # Display key metrics in columns
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric(
-                    label="Total Revenue",
-                    value=f"${basic_report['total_revenue']/1e9:,.1f}B",
-                    delta=f"{basic_report['total_companies']} companies"
-                )
-            
-            with col2:
-                st.metric(
-                    label="Total Net Income", 
-                    value=f"${basic_report['total_net_income']/1e9:,.1f}B",
-                    delta=f"{basic_report['profit_margin_avg']:.1f}% avg margin"
-                )
-            
-            with col3:
-                st.metric(
-                    label="Average Revenue",
-                    value=f"${basic_report['average_revenue']/1e6:,.0f}M",
-                    delta=f"per company"
-                )
-            
-            with col4:
-                st.metric(
-                    label="Expense Ratio",
-                    value=f"{basic_report['expense_ratio_avg']:.1f}%",
-                    delta="of revenue"
-                )
-            
-            # Company insights
-            st.subheader("🏢 Company Performance Analysis")
-            company_insights = st.session_state.report_generator.get_company_insights()
-            
-            # Display top performers
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.write("**Top Companies by Revenue:**")
-                top_revenue = company_insights.nlargest(5, 'Revenue_sum')[
-                    ['Company', 'Revenue_sum', 'Profit_Margin', 'Sector']
-                ].copy()
-                top_revenue['Revenue_sum'] = (top_revenue['Revenue_sum'] / 1e9).round(2)
-                top_revenue = top_revenue.rename(columns={
-                    'Revenue_sum': 'Revenue ($B)', 
-                    'Profit_Margin': 'Margin %'
-                })
-                st.dataframe(top_revenue, use_container_width=True, hide_index=True)
-            
-            with col2:
-                st.write("**Most Profitable Companies:**")
-                top_profit = company_insights.nlargest(5, 'Profit_Margin')[
-                    ['Company', 'Net_Income_sum', 'Profit_Margin', 'Sector']
-                ].copy()
-                top_profit['Net_Income_sum'] = (top_profit['Net_Income_sum'] / 1e9).round(2)
-                top_profit = top_profit.rename(columns={
-                    'Net_Income_sum': 'Net Income ($B)', 
-                    'Profit_Margin': 'Margin %'
-                })
-                st.dataframe(top_profit, use_container_width=True, hide_index=True)
-            
-            # Sector analysis
-            if show_sector_analysis:
-                st.subheader("🏭 Sector Analysis")
-                sector_analysis = st.session_state.report_generator.get_sector_analysis()
-                
-                if not sector_analysis.empty:
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        # Sector revenue pie chart
-                        sector_display = sector_analysis.copy()
-                        sector_display['Revenue_sum'] = sector_display['Revenue_sum'] / 1e9
-                        
-                        fig_pie = px.pie(
-                            sector_display, 
-                            values='Revenue_sum', 
-                            names='Sector',
-                            title='Revenue Distribution by Sector ($B)',
-                            hole=0.4,
-                            color_discrete_sequence=px.colors.qualitative.Set3
-                        )
-                        fig_pie.update_traces(textposition='inside', textinfo='percent+label')
-                        st.plotly_chart(fig_pie, use_container_width=True)
-                    
-                    with col2:
-                        # Sector profitability bar chart
-                        fig_bar = px.bar(
-                            sector_analysis,
-                            x='Sector',
-                            y='Avg_Profit_Margin',
-                            title='Average Profit Margin by Sector',
-                            color='Avg_Profit_Margin',
-                            color_continuous_scale='RdYlGn',
-                            text_auto='.1f'
-                        )
-                        fig_bar.update_traces(texttemplate='%{text}%', textposition='outside')
-                        fig_bar.update_layout(yaxis_title="Profit Margin (%)")
-                        st.plotly_chart(fig_bar, use_container_width=True)
-                    
-                    # Display sector data
-                    st.write("**Sector Summary:**")
-                    display_sector = sector_analysis.copy()
-                    display_sector['Revenue_sum'] = (display_sector['Revenue_sum'] / 1e9).round(2)
-                    display_sector['Avg_Profit_Margin'] = display_sector['Avg_Profit_Margin'].round(2)
-                    display_sector['Avg_Market_Cap'] = (display_sector['Avg_Market_Cap'] / 1e9).round(2)
-                    display_sector = display_sector.rename(columns={
-                        'Revenue_sum': 'Revenue ($B)',
-                        'Avg_Profit_Margin': 'Avg Margin %',
-                        'Company_Count': '# Companies',
-                        'Avg_Market_Cap': 'Avg Mkt Cap ($B)'
-                    })
-                    st.dataframe(display_sector, use_container_width=True, hide_index=True)
-            
-            # Visualizations
-            if show_visualizations:
-                st.subheader("📈 Financial Visualizations")
-                
-                # Create tabs for different visualizations
-                viz_tab1, viz_tab2, viz_tab3 = st.tabs(["Scatter Analysis", "Top Companies", "Distribution"])
-                
-                with viz_tab1:
-                    # Revenue vs Net Income scatter plot
-                    df_scatter = df.copy()
-                    df_scatter['Revenue_B'] = df_scatter['Revenue'] / 1e9
-                    df_scatter['Net_Income_B'] = df_scatter['Net_Income'] / 1e9
-                    df_scatter['Market_Cap_B'] = df_scatter['Market_Cap'] / 1e9
-                    
-                    fig_scatter = px.scatter(
-                        df_scatter,
-                        x='Revenue_B',
-                        y='Net_Income_B',
-                        color='Sector',
-                        size='Market_Cap_B',
-                        hover_data=['Company'],
-                        title='Revenue vs Net Income Analysis',
-                        labels={
-                            'Revenue_B': 'Revenue ($B)', 
-                            'Net_Income_B': 'Net Income ($B)',
-                            'Market_Cap_B': 'Market Cap ($B)'
-                        },
-                        size_max=60
-                    )
-                    fig_scatter.update_layout(legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01))
-                    st.plotly_chart(fig_scatter, use_container_width=True)
-                
-                with viz_tab2:
-                    # Top companies bar chart
-                    top_15 = df.nlargest(15, 'Revenue').copy()
-                    top_15['Revenue_B'] = top_15['Revenue'] / 1e9
-                    top_15['Net_Income_B'] = top_15['Net_Income'] / 1e9
-                    
-                    fig_bar = px.bar(
-                        top_15,
-                        x='Company',
-                        y=['Revenue_B', 'Net_Income_B'],
-                        title='Top 15 Companies - Revenue vs Net Income',
-                        barmode='group',
-                        labels={'value': 'Amount ($B)', 'variable': 'Metric'},
-                        color_discrete_map={'Revenue_B': '#1f77b4', 'Net_Income_B': '#2ca02c'}
-                    )
-                    fig_bar.update_xaxes(tickangle=45)
-                    st.plotly_chart(fig_bar, use_container_width=True)
-                
-                with viz_tab3:
-                    # Distribution of profit margins
-                    df['Profit_Margin'] = (df['Net_Income'] / df['Revenue'] * 100).round(2)
-                    
-                    fig_hist = px.histogram(
-                        df,
-                        x='Profit_Margin',
-                        nbins=20,
-                        title='Distribution of Profit Margins',
-                        labels={'Profit_Margin': 'Profit Margin (%)', 'count': 'Number of Companies'},
-                        color_discrete_sequence=['#1f77b4']
-                    )
-                    fig_hist.add_vline(x=df['Profit_Margin'].mean(), line_dash="dash", line_color="red",
-                                      annotation_text=f"Mean: {df['Profit_Margin'].mean():.1f}%")
-                    st.plotly_chart(fig_hist, use_container_width=True)
-            
-            # Risk Assessment
-            if show_risk_assessment:
-                st.subheader("⚠️ Risk Assessment")
-                risk_data = st.session_state.report_generator.generate_risk_assessment()
-                
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric(
-                        "High Risk Companies",
-                        risk_data['high_debt_companies'],
-                        delta=f"out of {basic_report['total_companies']}",
-                        delta_color="inverse"
-                    )
-                
-                with col2:
-                    st.metric(
-                        "Low Margin Companies", 
-                        risk_data['low_profit_margin_companies'],
-                        delta="margin < 5%",
-                        delta_color="inverse"
-                    )
-                
-                with col3:
-                    st.metric(
-                        "Profit Volatility",
-                        f"{risk_data['average_volatility']:.2f}%",
-                        delta="std deviation",
-                        delta_color="off"
-                    )
-                
-                if risk_data['companies_at_risk']:
-                    st.warning(f"⚠️ **Companies requiring attention:** {', '.join(risk_data['companies_at_risk'][:5])}")
-                    if len(risk_data['companies_at_risk']) > 5:
-                        st.caption(f"... and {len(risk_data['companies_at_risk']) - 5} more")
-            
-            # GPT Insights (placeholder if API key provided)
-            if show_gpt_insights and api_key:
-                st.subheader("🤖 GPT-4 Insights")
-                with st.spinner("Generating AI-powered insights..."):
-                    # This is a placeholder - in production you'd call OpenAI API
-                    st.info("""
-                    **AI Analysis Summary:**
-                    
-                    Based on the financial data, the technology sector shows the highest growth potential 
-                    with average profit margins of 15.2%. However, it also carries higher volatility.
-                    
-                    **Key Recommendations:**
-                    1. Consider diversifying into Healthcare and Utilities for stable returns
-                    2. High-risk companies (n=8) need immediate working capital optimization
-                    3. Top 3 companies show 40% higher efficiency than industry average
-                    
-                    *Note: This is a simulated insight. Add a valid OpenAI API key for real analysis.*
-                    """)
-            
-            # Financial Summary
-            st.header("📝 Financial Summary")
-            basic_summary = generate_basic_summary(basic_report)
-            st.info(basic_summary)
-            
-            # Export options
-            st.header("📁 Export Options")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                csv_company = company_insights.to_csv(index=False)
-                st.download_button(
-                    label="📊 Company Report (CSV)",
-                    data=csv_company,
-                    file_name=f"company_report_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-            
-            with col2:
-                if show_sector_analysis and 'sector_analysis' in locals() and not sector_analysis.empty:
-                    sector_csv = sector_analysis.to_csv(index=False)
-                    st.download_button(
-                        label="🏭 Sector Analysis (CSV)",
-                        data=sector_csv,
-                        file_name=f"sector_analysis_{datetime.now().strftime('%Y%m%d')}.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-            
-            with col3:
-                # Create full report JSON
-                full_report = {
-                    "summary": basic_report,
-                    "companies": company_insights.to_dict('records'),
-                    "risk_assessment": risk_data,
-                    "generated_at": datetime.now().isoformat()
-                }
-                report_json = json.dumps(full_report, indent=2, default=str)
-                st.download_button(
-                    label="📈 Full Report (JSON)",
-                    data=report_json,
-                    file_name=f"financial_report_{datetime.now().strftime('%Y%m%d')}.json",
-                    mime="application/json",
-                    use_container_width=True
-                )
-            
-            with col4:
-                # Create a simple Excel-like summary
-                summary_df = pd.DataFrame([basic_report])
-                summary_csv = summary_df.to_csv(index=False)
-                st.download_button(
-                    label="📋 Summary (CSV)",
-                    data=summary_csv,
-                    file_name=f"summary_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-                        
-        except Exception as e:
-            st.error(f"❌ Error generating report: {str(e)}")
-            st.exception(e)
-    
+            raw_data = pd.read_csv(uploaded_file)
+            st.subheader("Preview uploaded data")
+            st.dataframe(raw_data.head(10), use_container_width=True)
+
+            if st.button("Use Uploaded Data", type="primary"):
+                validated_data = prepare_data(raw_data)
+                st.session_state.financial_data = validated_data[FINANCIAL_COLUMNS].copy()
+                st.success("Uploaded data is now active.")
+                st.rerun()
+        except Exception as exc:
+            st.error(f"Could not read or validate the uploaded file: {exc}")
+
+
+# ============================================================
+# PAGE: DASHBOARD
+# ============================================================
+
+def page_dashboard(data):
+    st.title("📈 Financial Dashboard")
+    summary = build_financial_summary(data)
+
+    a, b, c, d = st.columns(4)
+    a.metric("Revenue", money(summary["total_revenue"]))
+    b.metric("Expenses", money(summary["total_expenses"]))
+    c.metric("Profit", money(summary["total_profit"]))
+    d.metric("Profit Margin", f"{summary['overall_profit_margin_percent']:.2f}%")
+
+    st.subheader("Company financial metrics")
+    st.dataframe(
+        data[
+            [
+                "Company",
+                "Sector",
+                "Revenue",
+                "Expenses",
+                "Profit",
+                "Profit Margin (%)",
+                "Current Ratio",
+                "Debt Ratio (%)",
+                "Risk Level",
+            ]
+        ].round(2),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    chart = px.bar(
+        data,
+        x="Company",
+        y=["Revenue", "Expenses", "Profit"],
+        barmode="group",
+        title="Revenue, Expenses and Profit by Company",
+    )
+    st.plotly_chart(chart, use_container_width=True)
+
+
+# ============================================================
+# PAGE: COMPANY ANALYSIS
+# ============================================================
+
+def page_company_analysis(data):
+    st.title("🏢 Company Analysis")
+    selected_company = st.selectbox(
+        "Select a company",
+        data["Company"].astype(str).tolist(),
+    )
+    row = data[data["Company"] == selected_company].iloc[0]
+
+    st.subheader(selected_company)
+    a, b, c = st.columns(3)
+    a.metric("Revenue", money(row["Revenue"]))
+    b.metric("Expenses", money(row["Expenses"]))
+    c.metric("Profit", money(row["Profit"]))
+
+    d, e, f = st.columns(3)
+    d.metric("Profit Margin", f"{row['Profit Margin (%)']:.2f}%")
+    e.metric("Current Ratio", f"{row['Current Ratio']:.2f}")
+    f.metric("Debt Ratio", f"{row['Debt Ratio (%)']:.2f}%")
+
+    st.write("**Sector:**", row["Sector"])
+    st.write("**Risk level:**", row["Risk Level"])
+
+    if row["Profit"] < 0:
+        st.warning("This company has expenses greater than revenue.")
+    if row["Current Ratio"] < 1:
+        st.warning(
+            "Current liabilities exceed current assets. Review short-term liquidity."
+        )
+    if row["Debt Ratio (%)"] > 60:
+        st.warning("The debt-to-assets ratio is relatively high.")
+
+    company_metrics = pd.DataFrame(
+        {
+            "Metric": ["Revenue", "Expenses", "Profit"],
+            "Amount": [row["Revenue"], row["Expenses"], row["Profit"]],
+        }
+    )
+    fig = px.bar(
+        company_metrics,
+        x="Metric",
+        y="Amount",
+        title=f"Financial Performance: {selected_company}",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ============================================================
+# PAGE: SECTOR ANALYSIS
+# ============================================================
+
+def page_sector_analysis(data):
+    st.title("🏭 Sector Analysis")
+    sector_data = (
+        data.groupby("Sector", as_index=False)
+        .agg(
+            {
+                "Revenue": "sum",
+                "Expenses": "sum",
+                "Profit": "sum",
+                "Total Assets": "sum",
+                "Total Debt": "sum",
+            }
+        )
+    )
+    sector_data["Profit Margin (%)"] = np.where(
+        sector_data["Revenue"] > 0,
+        sector_data["Profit"] / sector_data["Revenue"] * 100,
+        0,
+    )
+
+    st.dataframe(sector_data.round(2), use_container_width=True, hide_index=True)
+
+    fig = px.bar(
+        sector_data,
+        x="Sector",
+        y="Profit",
+        color="Sector",
+        title="Total Profit by Sector",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig2 = px.bar(
+        sector_data,
+        x="Sector",
+        y="Profit Margin (%)",
+        title="Profit Margin by Sector",
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
+
+# ============================================================
+# PAGE: VISUALIZATIONS
+# ============================================================
+
+def page_visualizations(data):
+    st.title("📉 Financial Visualizations")
+    fig1 = px.scatter(
+        data,
+        x="Revenue",
+        y="Profit",
+        size="Total Assets",
+        color="Risk Level",
+        hover_name="Company",
+        title="Revenue vs Profit",
+    )
+    st.plotly_chart(fig1, use_container_width=True)
+
+    fig2 = px.bar(
+        data,
+        x="Company",
+        y="Profit Margin (%)",
+        color="Risk Level",
+        title="Profit Margin by Company",
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
+    fig3 = px.scatter(
+        data,
+        x="Total Assets",
+        y="Total Debt",
+        color="Sector",
+        hover_name="Company",
+        title="Total Assets vs Total Debt",
+    )
+    st.plotly_chart(fig3, use_container_width=True)
+
+    risk_counts = (
+        data["Risk Level"].value_counts()
+        .rename_axis("Risk Level")
+        .reset_index(name="Companies")
+    )
+    fig4 = px.pie(
+        risk_counts,
+        names="Risk Level",
+        values="Companies",
+        title="Distribution of Risk Levels",
+    )
+    st.plotly_chart(fig4, use_container_width=True)
+
+
+# ============================================================
+# PAGE: RISK ASSESSMENT
+# ============================================================
+
+def page_risk_assessment(data):
+    st.title("⚠️ Financial Risk Assessment")
+    st.write(
+        "Risk levels are assigned using simple financial thresholds. "
+        "They are indicators for review, not guarantees of default."
+    )
+
+    st.dataframe(
+        data[
+            [
+                "Company",
+                "Profit Margin (%)",
+                "Current Ratio",
+                "Debt Ratio (%)",
+                "Risk Level",
+            ]
+        ].round(2),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    high_risk = data[data["Risk Level"] == "High Risk"]
+    if not high_risk.empty:
+        st.error("Companies flagged as High Risk")
+        st.dataframe(
+            high_risk[["Company", "Sector", "Risk Level"]],
+            use_container_width=True,
+            hide_index=True,
+        )
     else:
-        # Welcome message with instructions
-        st.info("""
-        👋 **Welcome to the Automated Financial Report Generator!**
-        
-        **Getting Started:**
-        1. Upload your financial ratios CSV file using the uploader above
-        2. Or click one of the sample data buttons in the sidebar
-        3. The app will automatically transform your ratios into synthetic Revenue/Expenses
-        4. All visualizations and metrics will work with the transformed data
-        
-        **Your dataset will be used to:**
-        - Create realistic company profiles with sector classifications
-        - Generate revenue and expense estimates based on your ratios
-        - Identify risk patterns from your original risk labels
-        - Produce comprehensive charts, tables, and exportable reports
-        
-        **Expected CSV format:**
-        - Should contain columns like: risk, RTA, ROCE, PATTI, CURRENT, QUICK, DER, DSCR
-        - The 'risk' column (0/1) is used for risk assessment
-        - Other financial ratios are used to estimate company size and profitability
-        """)
-        
-        # Show sample of expected format
-        with st.expander("📋 View sample CSV format"):
-            sample_format = pd.DataFrame({
-                'risk': [0, 1, 0, 0, 1],
-                'RTA': [15.2, 8.7, 22.1, 12.4, 6.8],
-                'ROCE': [18.5, 10.2, 25.3, 14.6, 8.9],
-                'PATTI': [12.3, 4.5, 18.7, 9.8, 3.2],
-                'CURRENT': [1.8, 0.9, 2.3, 1.5, 0.7],
-                'QUICK': [1.2, 0.5, 1.8, 1.1, 0.4],
-                'DER': [1.5, 2.8, 0.9, 1.3, 3.2],
-                'DSCR': [2.1, 1.1, 3.2, 2.4, 0.9]
-            })
-            st.dataframe(sample_format, use_container_width=True)
-            st.caption("Your CSV should have at least a 'risk' column and some financial ratios")
+        st.success("No companies are currently flagged as High Risk.")
+
+    st.subheader("How risk is estimated")
+    st.markdown(
+        """
+        - Profit margin below 5% adds a risk indicator.
+        - Current ratio below 1 adds a liquidity risk indicator.
+        - Debt ratio above 60% adds a leverage risk indicator.
+        - Negative profit adds a profitability risk indicator.
+
+        **High Risk:** 3 or more indicators  
+        **Medium Risk:** 1–2 indicators  
+        **Low Risk:** no indicators
+        """
+    )
+
+
+# ============================================================
+# PAGE: MACHINE LEARNING PREDICTIONS
+# ============================================================
+
+def page_ml_predictions(data):
+    st.title("🤖 ML Risk Predictions")
+    if not SKLEARN_AVAILABLE:
+        st.error("Scikit-learn is not installed. Run `pip install scikit-learn`.")
+        return
+
+    if len(data) < 5:
+        st.warning(
+            "At least five company records are recommended for this demo. "
+            "More real, labeled records are needed for a useful model evaluation."
+        )
+        return
+
+    st.warning(
+        "This demo trains on rule-generated labels from the same financial "
+        "dataset. Results are educational and do not demonstrate independently "
+        "validated predictive accuracy."
+    )
+
+    feature_columns = [
+        "Revenue",
+        "Expenses",
+        "Total Assets",
+        "Total Debt",
+        "Current Assets",
+        "Current Liabilities",
+        "Profit Margin (%)",
+        "Current Ratio",
+        "Debt Ratio (%)",
+    ]
+    X = data[feature_columns].replace([np.inf, -np.inf], np.nan).fillna(0)
+    y = data["Risk Level"]
+
+    if y.nunique() < 2:
+        st.info(
+            "The current dataset contains only one risk class. "
+            "Add companies with different financial profiles."
+        )
+        return
+
+    model = RandomForestClassifier(
+        n_estimators=100,
+        random_state=42,
+        class_weight="balanced",
+    )
+    model.fit(X, y)
+    predictions = model.predict(X)
+
+    results = data[["Company", "Sector", "Risk Level"]].copy()
+    results["ML Risk Prediction"] = predictions
+    results["Matches Rule Label"] = results["Risk Level"] == results["ML Risk Prediction"]
+
+    st.subheader("Predictions")
+    st.dataframe(results, use_container_width=True, hide_index=True)
+    st.metric(
+        "Training-set label agreement",
+        f"{accuracy_score(y, predictions) * 100:.1f}%",
+    )
+    st.caption(
+        "Training-set agreement is not test accuracy. A reliable model "
+        "requires more records and evaluation on unseen data."
+    )
+
+    importance = pd.DataFrame(
+        {
+            "Feature": feature_columns,
+            "Importance": model.feature_importances_,
+        }
+    ).sort_values("Importance", ascending=False)
+    fig = px.bar(
+        importance,
+        x="Importance",
+        y="Feature",
+        orientation="h",
+        title="Feature Importance in the Demo Model",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ============================================================
+# PAGE: AI INSIGHTS
+# ============================================================
+
+def page_ai_insights(data):
+    st.title("🧠 AI Financial Insights")
+    st.write(
+        "Generate an explanation of the financial metrics using a locally running Ollama model."
+    )
+    st.caption(
+        f"Configured model: {OLLAMA_MODEL}. "
+        "AI output may be inaccurate; verify financial conclusions."
+    )
+
+    if st.button("Generate AI Insights", type="primary"):
+        with st.spinner("Generating financial insights..."):
+            st.session_state.ai_insights = generate_ai_insights(data)
+
+    if st.session_state.get("ai_insights"):
+        st.markdown(st.session_state.ai_insights)
+        st.download_button(
+            "Download AI Insights",
+            data=st.session_state.ai_insights,
+            file_name="ai_financial_insights.txt",
+            mime="text/plain",
+        )
+
+
+# ============================================================
+# PAGE: FINANCIAL SUMMARY
+# ============================================================
+
+def page_financial_summary(data):
+    st.title("📝 Financial Summary")
+    summary = build_financial_summary(data)
+    st.subheader("Overall Summary")
+
+    a, b = st.columns(2)
+    a.write("**Companies analyzed:**")
+    a.write(summary["number_of_companies"])
+    a.write("**Total revenue:**")
+    a.write(money(summary["total_revenue"]))
+    a.write("**Total expenses:**")
+    a.write(money(summary["total_expenses"]))
+
+    b.write("**Total profit:**")
+    b.write(money(summary["total_profit"]))
+    b.write("**Overall profit margin:**")
+    b.write(f"{summary['overall_profit_margin_percent']:.2f}%")
+    b.write("**High-risk companies:**")
+    b.write(summary["high_risk_companies"])
+
+    st.subheader("Company-level summary")
+    st.dataframe(
+        data[
+            [
+                "Company",
+                "Sector",
+                "Revenue",
+                "Expenses",
+                "Profit",
+                "Profit Margin (%)",
+                "Risk Level",
+            ]
+        ].round(2),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# ============================================================
+# PAGE: EXPORT REPORTS
+# ============================================================
+
+def page_export_reports(data):
+    st.title("📥 Export Reports")
+    summary = build_financial_summary(data)
+    st.subheader("Download financial data")
+
+    csv_bytes = data.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download Financial Data (CSV)",
+        data=csv_bytes,
+        file_name="financial_analysis.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    json_text = json.dumps(
+        {
+            "summary": summary,
+            "companies": data.to_dict(orient="records"),
+        },
+        indent=2,
+        default=str,
+    )
+    st.download_button(
+        "Download Report (JSON)",
+        data=json_text,
+        file_name="financial_report.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    report_text = create_report_text(data)
+    st.download_button(
+        "Download Report (TXT)",
+        data=report_text,
+        file_name="financial_report.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
+
+    st.subheader("Preview report")
+    st.text(report_text)
+
+
+# ============================================================
+# MAIN APPLICATION
+# ============================================================
+
+def main():
+    init_auth_database()
+
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+
+    if "financial_data" not in st.session_state:
+        st.session_state.financial_data = get_sample_data()
+
+    if "ai_insights" not in st.session_state:
+        st.session_state.ai_insights = ""
+
+    if not st.session_state.logged_in:
+        show_auth_page()
+        return
+
+    user = st.session_state.user
+
+    # Prepare financial metrics and risk levels.
+    try:
+        data = prepare_data(st.session_state.financial_data)
+        data = add_risk_assessment(data)
+    except Exception as exc:
+        st.error(f"Could not process the financial data: {exc}")
+        st.info(
+            "Open Data Upload and load the sample data or upload a corrected CSV."
+        )
+        return
+
+    with st.sidebar:
+        st.title("📊 Financial Reports")
+        st.write(f"Welcome, **{user['name']}**")
+        st.caption(user["email"])
+
+        if st.button("🚪 Logout", use_container_width=True):
+            logout()
+
+        st.divider()
+        page = st.radio(
+            "Navigation",
+            [
+                "Home",
+                "Data Upload",
+                "Dashboard",
+                "Company Analysis",
+                "Sector Analysis",
+                "Visualizations",
+                "Risk Assessment",
+                "ML Predictions",
+                "AI Insights",
+                "Financial Summary",
+                "Export Reports",
+            ],
+        )
+        st.divider()
+        st.caption("Automated Financial Report Generator")
+        st.caption("Demo version")
+
+    if page == "Home":
+        page_home(data)
+    elif page == "Data Upload":
+        page_data_upload()
+    elif page == "Dashboard":
+        page_dashboard(data)
+    elif page == "Company Analysis":
+        page_company_analysis(data)
+    elif page == "Sector Analysis":
+        page_sector_analysis(data)
+    elif page == "Visualizations":
+        page_visualizations(data)
+    elif page == "Risk Assessment":
+        page_risk_assessment(data)
+    elif page == "ML Predictions":
+        page_ml_predictions(data)
+    elif page == "AI Insights":
+        page_ai_insights(data)
+    elif page == "Financial Summary":
+        page_financial_summary(data)
+    elif page == "Export Reports":
+        page_export_reports(data)
+
 
 if __name__ == "__main__":
     main()
